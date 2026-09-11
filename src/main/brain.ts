@@ -5,37 +5,100 @@
 
 import { execFile, spawn, ChildProcess } from 'child_process'
 import { existsSync, readFileSync, rmSync } from 'fs'
-import { join, extname } from 'path'
+import { join, extname, delimiter, dirname, resolve as resolvePath } from 'path'
 import { homedir, tmpdir } from 'os'
 import type { BrainBackend, BrainRequest, BrainResult, BrainStatus, BrainTier, LocalModelInfo } from '../shared/types'
 
 // Electron apps launched from Finder/Dock inherit a minimal PATH that misses
 // Homebrew and user bins — resolve the CLIs explicitly and augment PATH.
-const CLI_DIRS = [
-  '/opt/homebrew/bin',
-  '/usr/local/bin',
-  join(homedir(), '.local', 'bin'),
-  join(homedir(), 'bin'),
-  join(homedir(), '.npm-global', 'bin'),
-  '/usr/bin'
-]
+// On Windows the CLIs are npm shims (claude.cmd / codex.cmd) under %APPDATA%\npm,
+// or claude.exe from the native installer under ~/.local/bin.
+const IS_WIN = process.platform === 'win32'
+
+const CLI_DIRS: string[] = IS_WIN
+  ? [
+      join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'npm'),
+      join(homedir(), '.local', 'bin'),
+      join(process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local'), 'Programs', 'claude'),
+      join(process.env.ProgramFiles ?? 'C:\\Program Files', 'nodejs')
+    ]
+  : [
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+      join(homedir(), '.local', 'bin'),
+      join(homedir(), 'bin'),
+      join(homedir(), '.npm-global', 'bin'),
+      '/usr/bin'
+    ]
+
+// Windows executable extensions worth trying, most direct first.
+const WIN_EXTS = ['.exe', '.cmd', '.bat']
 
 // The ChatGPT desktop app bundles a signed, version-matched codex that shares
 // the user's ChatGPT sign-in — prefer it over any npm-installed copy.
 const CODEX_BUNDLED = '/Applications/ChatGPT.app/Contents/Resources/codex'
 
-function resolveCli(name: string): string {
-  if (name === 'codex' && existsSync(CODEX_BUNDLED)) return CODEX_BUNDLED
-  for (const dir of CLI_DIRS) {
-    const p = join(dir, name)
+/** A launchable CLI: the file to spawn plus any leading args (e.g. node + script). */
+export interface ResolvedCli {
+  file: string
+  args: string[]
+}
+
+function searchDirs(): string[] {
+  const fromPath = (process.env.PATH ?? '').split(delimiter).filter(Boolean)
+  return [...CLI_DIRS, ...fromPath]
+}
+
+/** npm's Windows shims (`foo.cmd`) wrap `node "%dp0%\node_modules\<pkg>\cli.js" %*`.
+ *  Node refuses to spawn .cmd/.bat files without a shell (CVE-2024-27980), and a
+ *  shell would mangle multi-line prompt args — so run the JS entry point directly. */
+export function npmShimEntry(cmdPath: string): string | null {
+  try {
+    const text = readFileSync(cmdPath, 'utf8')
+    const m = text.match(/"%dp0%\\([^"]+\.(?:c|m)?js)"/i)
+    if (!m) return null
+    const entry = resolvePath(dirname(cmdPath), m[1])
+    return existsSync(entry) ? entry : null
+  } catch {
+    return null
+  }
+}
+
+function nodeExe(): string {
+  for (const dir of searchDirs()) {
+    const p = join(dir, 'node.exe')
     if (existsSync(p)) return p
   }
-  return name // hope PATH has it
+  return 'node'
+}
+
+export function resolveCli(name: string): ResolvedCli {
+  if (!IS_WIN) {
+    if (name === 'codex' && existsSync(CODEX_BUNDLED)) return { file: CODEX_BUNDLED, args: [] }
+    for (const dir of CLI_DIRS) {
+      const p = join(dir, name)
+      if (existsSync(p)) return { file: p, args: [] }
+    }
+    return { file: name, args: [] } // hope PATH has it
+  }
+  for (const dir of searchDirs()) {
+    for (const ext of WIN_EXTS) {
+      const p = join(dir, name + ext)
+      if (!existsSync(p)) continue
+      if (ext === '.exe') return { file: p, args: [] }
+      const entry = npmShimEntry(p)
+      if (entry) return { file: nodeExe(), args: [entry] }
+    }
+  }
+  return { file: name, args: [] }
 }
 
 function brainEnv(): NodeJS.ProcessEnv {
-  const extra = CLI_DIRS.join(':')
-  return { ...process.env, PATH: `${process.env.PATH ?? ''}:${extra}` }
+  // Windows env keys are case-insensitive and usually spelled `Path`; reuse the
+  // existing key so the child does not end up with two PATH variables.
+  const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH'
+  const extra = CLI_DIRS.join(delimiter)
+  return { ...process.env, [pathKey]: `${process.env[pathKey] ?? ''}${delimiter}${extra}` }
 }
 
 const CLAUDE_TIER_MODEL: Record<BrainTier, string | null> = {
@@ -214,7 +277,8 @@ async function runLocal(req: BrainRequest, started: number): Promise<BrainResult
 
 function which(cmd: string, args: string[]): Promise<string | null> {
   return new Promise((resolve) => {
-    execFile(resolveCli(cmd), args, { timeout: 15000, env: brainEnv() }, (err, stdout) => {
+    const cli = resolveCli(cmd)
+    execFile(cli.file, [...cli.args, ...args], { timeout: 15000, env: brainEnv(), windowsHide: true }, (err, stdout) => {
       if (err) resolve(null)
       else resolve(stdout.trim().split('\n')[0] || 'available')
     })
@@ -378,9 +442,11 @@ export async function brainRun(req: BrainRequest, backend: BrainBackend): Promis
 
   const runOnce = (extraNudge?: string): Promise<string> =>
     new Promise((resolve, reject) => {
-      const child = spawn(resolveCli(call.cmd), call.args, {
+      const cli = resolveCli(call.cmd)
+      const child = spawn(cli.file, [...cli.args, ...call.args], {
         env: brainEnv(),
-        stdio: ['pipe', 'pipe', 'pipe']
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true
       })
       running.set(req.id, child)
       let out = ''
